@@ -113,6 +113,9 @@ class CLIPlatformAdapter(Platform):
         # Unix Socket配置
         self.socket_path = platform_config.get("socket_path", "/tmp/astrbot.sock")
 
+        # Token认证配置
+        self.auth_token = self._ensure_auth_token()
+
         # 会话隔离配置
         self.use_isolated_sessions = platform_config.get("use_isolated_sessions", False)
         self.session_ttl = platform_config.get(
@@ -143,6 +146,57 @@ class CLIPlatformAdapter(Platform):
         """
         logger.info("[ENTRY] CLIPlatformAdapter.run inputs={}")
         return self._run_loop()
+
+    def _ensure_auth_token(self) -> str | None:
+        """[原子模块] TokenManager: 确保认证token存在,不存在则自动生成
+
+        I/O契约:
+            Input: None
+            Output: str | None (token字符串或None)
+        """
+        import os
+        import secrets
+
+        token_file = "/AstrBot/data/.cli_token"
+
+        logger.debug("[ENTRY] _ensure_auth_token inputs={}")
+
+        try:
+            # 如果token文件已存在,直接读取
+            if os.path.exists(token_file):
+                with open(token_file, encoding="utf-8") as f:
+                    token = f.read().strip()
+
+                if token:
+                    logger.info("[SECURITY] Authentication token loaded from file")
+                    logger.debug(
+                        "[EXIT] _ensure_auth_token return={token_length=%d}", len(token)
+                    )
+                    return token
+                else:
+                    logger.warning("[SECURITY] Token file is empty, regenerating")
+
+            # 首次启动或token为空,自动生成新token
+            token = secrets.token_urlsafe(32)
+
+            # 写入文件
+            with open(token_file, "w", encoding="utf-8") as f:
+                f.write(token)
+
+            # 设置严格权限(仅所有者可读写)
+            os.chmod(token_file, 0o600)
+
+            logger.info("[SECURITY] Generated new authentication token: %s", token)
+            logger.info("[SECURITY] Token saved to: %s (permissions: 600)", token_file)
+            logger.debug(
+                "[EXIT] _ensure_auth_token return={token_length=%d}", len(token)
+            )
+            return token
+
+        except Exception as e:
+            logger.error("[ERROR] Failed to ensure token: %s", e)
+            logger.warning("[SECURITY] Authentication disabled due to token error")
+            return None
 
     async def _run_loop(self) -> None:
         """主运行循环
@@ -354,6 +408,7 @@ class CLIPlatformAdapter(Platform):
                 request = json.loads(data.decode("utf-8"))
                 message_text = request.get("message", "")
                 request_id = request.get("request_id", str(uuid.uuid4()))
+                auth_token = request.get("auth_token", "")
 
                 logger.info(
                     f"[PROCESS] Received socket request: {message_text[:50]}..."
@@ -366,6 +421,33 @@ class CLIPlatformAdapter(Platform):
                 )
                 await loop.sock_sendall(client_socket, error_response.encode("utf-8"))
                 return
+
+            # Token验证
+            if self.auth_token:
+                if not auth_token:
+                    logger.warning("[SECURITY] Request rejected: missing auth_token")
+                    error_response = json.dumps(
+                        {"status": "error", "error": "Unauthorized: missing token"}
+                    )
+                    await loop.sock_sendall(
+                        client_socket, error_response.encode("utf-8")
+                    )
+                    return
+
+                if auth_token != self.auth_token:
+                    logger.warning(
+                        "[SECURITY] Request rejected: invalid auth_token (length=%d)",
+                        len(auth_token),
+                    )
+                    error_response = json.dumps(
+                        {"status": "error", "error": "Unauthorized: invalid token"}
+                    )
+                    await loop.sock_sendall(
+                        client_socket, error_response.encode("utf-8")
+                    )
+                    return
+
+                logger.debug("[SECURITY] Token validation passed")
 
             # 创建响应Future
             response_future = asyncio.Future()
