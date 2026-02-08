@@ -223,7 +223,9 @@ class SocketClientHandler:
             pattern = request.get("pattern", "")
             use_regex = request.get("regex", False)  # 是否使用正则表达式
 
-            logger.debug(f"[LogFilter] lines={lines}, level={level_filter}, pattern={repr(pattern)}, regex={use_regex}")
+            logger.debug(
+                f"[LogFilter] lines={lines}, level={level_filter}, pattern={repr(pattern)}, regex={use_regex}"
+            )
 
             # 日志文件路径
             log_path = os.path.join(self.data_path, "logs", "astrbot.log")
