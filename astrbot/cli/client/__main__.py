@@ -287,50 +287,27 @@ def send_message(
         client_socket.close()
 
 
-def get_logs(
+def _socket_action_request(
+    action: str,
+    payload: dict,
     socket_path: str | None = None,
     timeout: float = 30.0,
-    lines: int = 100,
-    level: str = "",
-    pattern: str = "",
-    use_regex: bool = False,
 ) -> dict:
-    """获取AstrBot日志
-
-    Args:
-        socket_path: Socket路径
-        timeout: 超时时间
-        lines: 返回的日志行数
-        level: 日志级别过滤
-        pattern: 模式过滤
-        use_regex: 是否使用正则表达式
-
-    Returns:
-        响应字典
-    """
+    """发送 socket action 请求并返回响应。"""
     data_dir = get_data_path()
 
-    # 加载认证token
     auth_token = load_auth_token()
-
-    # 创建请求
-    request = {
-        "action": "get_logs",
+    request_payload = {
+        "action": action,
         "request_id": str(uuid.uuid4()),
-        "lines": lines,
-        "level": level,
-        "pattern": pattern,
-        "regex": use_regex,
     }
+    request_payload.update(payload)
 
-    # 添加token
     if auth_token:
-        request["auth_token"] = auth_token
+        request_payload["auth_token"] = auth_token
 
-    # 加载连接信息
     connection_info = load_connection_info(data_dir)
 
-    # 连接到服务器
     try:
         if connection_info is not None:
             client_socket = connect_to_server(connection_info, timeout)
@@ -346,11 +323,9 @@ def get_logs(
         return {"status": "error", "error": f"Connection error: {e}"}
 
     try:
-        # 发送请求
-        request_data = json.dumps(request, ensure_ascii=False).encode("utf-8")
+        request_data = json.dumps(request_payload, ensure_ascii=False).encode("utf-8")
         client_socket.sendall(request_data)
 
-        # 接收响应
         response_data = b""
         while True:
             chunk = client_socket.recv(4096)
@@ -372,6 +347,28 @@ def get_logs(
         return {"status": "error", "error": f"Communication error: {e}"}
     finally:
         client_socket.close()
+
+
+def get_logs(
+    socket_path: str | None = None,
+    timeout: float = 30.0,
+    lines: int = 100,
+    level: str = "",
+    pattern: str = "",
+    use_regex: bool = False,
+) -> dict:
+    """获取AstrBot日志"""
+    return _socket_action_request(
+        action="get_logs",
+        payload={
+            "lines": lines,
+            "level": level,
+            "pattern": pattern,
+            "regex": use_regex,
+        },
+        socket_path=socket_path,
+        timeout=timeout,
+    )
 
 
 def format_response(response: dict) -> str:
@@ -602,6 +599,167 @@ def log(
     else:
         # 直接读取日志文件（默认）
         _read_log_from_file(lines, level, pattern, regex)
+
+
+@main.command(
+    "subagent-wizard",
+    help="交互式 SubAgent 自动配置（走 CLI Socket，无需 dashboard token）",
+)
+@click.option("--goal", default="", help="用于生成 SubAgent 的目标描述")
+@click.argument("goal_parts", nargs=-1)
+@click.option("--max-agents", default=2, type=int, help="最多生成多少个 SubAgent")
+@click.option(
+    "--max-tools-per-agent",
+    default=4,
+    type=int,
+    help="每个 SubAgent 最多绑定工具数量",
+)
+@click.option(
+    "--default-provider-id",
+    default=None,
+    help="生成 SubAgent 时默认 provider id",
+)
+@click.option(
+    "--default-persona-id",
+    default=None,
+    help="生成 SubAgent 时默认 persona id",
+)
+@click.option(
+    "--no-auto-create-persona",
+    is_flag=True,
+    help="应用配置前不自动创建缺失 persona",
+)
+@click.option("--allow-warnings", is_flag=True, help="存在 warnings 时也继续应用配置")
+@click.option("--yes", "auto_yes", is_flag=True, help="跳过确认，直接应用配置")
+@click.option(
+    "-t", "--timeout", default=20.0, type=float, help="Socket 请求超时时间（秒）"
+)
+def subagent_wizard(
+    goal: str,
+    goal_parts: tuple[str, ...],
+    max_agents: int,
+    max_tools_per_agent: int,
+    default_provider_id: str | None,
+    default_persona_id: str | None,
+    no_auto_create_persona: bool,
+    allow_warnings: bool,
+    auto_yes: bool,
+    timeout: float,
+) -> None:
+    resolved_goal = goal.strip() or " ".join(goal_parts).strip()
+    if not resolved_goal:
+        resolved_goal = click.prompt("请输入目标")
+    max_agents = max(1, min(max_agents, 8))
+    max_tools_per_agent = max(1, min(max_tools_per_agent, 12))
+
+    try:
+        plan_payload = {
+            "goal": resolved_goal,
+            "max_agents": max_agents,
+            "max_tools_per_agent": max_tools_per_agent,
+            "timeout": timeout,
+        }
+        if default_provider_id:
+            plan_payload["default_provider_id"] = default_provider_id
+        if default_persona_id:
+            plan_payload["default_persona_id"] = default_persona_id
+
+        plan_resp = _socket_action_request(
+            action="subagent_auto_plan",
+            payload=plan_payload,
+            timeout=timeout,
+        )
+        if plan_resp.get("status") == "error":
+            raise RuntimeError(str(plan_resp.get("error") or "socket request failed"))
+
+        if plan_resp.get("status") != "ok":
+            planner_info = _as_dict(_as_dict(plan_resp.get("data")).get("planner"))
+            planner_reason = planner_info.get("reason")
+            base_message = str(plan_resp.get("message") or "自动规划失败")
+            if planner_reason:
+                raise RuntimeError(f"{base_message} (reason={planner_reason})")
+            raise RuntimeError(base_message)
+
+        data = _as_dict(plan_resp.get("data"))
+        draft_config = data.get("draft_config") or {}
+        if not isinstance(draft_config, dict):
+            raise RuntimeError("自动规划返回了无效的 draft_config")
+
+        warnings_list = data.get("warnings", [])
+        errors_list = data.get("errors", [])
+
+        if errors_list:
+            click.echo("\n规划错误：", err=True)
+            for line in errors_list:
+                click.echo(f"- {line}", err=True)
+            raise SystemExit(1)
+
+        if warnings_list:
+            click.echo("\n规划警告：")
+            for line in warnings_list:
+                click.echo(f"- {line}")
+
+        agents = draft_config.get("agents", [])
+        click.echo(f"\n已生成 {len(agents)} 个 SubAgent：")
+        for agent in agents:
+            name = agent.get("name", "<未命名>")
+            tools = agent.get("tools", [])
+            provider_id = agent.get("provider_id") or "<默认>"
+            persona_id = agent.get("persona_id") or "<默认>"
+            click.echo(
+                f"- {name} (provider={provider_id}, persona={persona_id}, tools={len(tools)})"
+            )
+
+        apply_with_warnings = allow_warnings
+        if warnings_list and not apply_with_warnings:
+            apply_with_warnings = click.confirm(
+                "检测到 warnings，是否仍然应用？",
+                default=False,
+            )
+            if not apply_with_warnings:
+                click.echo("已取消：未应用配置。")
+                raise SystemExit(1)
+
+        if not auto_yes and not click.confirm(
+            "现在应用这份 SubAgent 配置吗？", default=True
+        ):
+            click.echo("已取消：未应用配置。")
+            raise SystemExit(1)
+
+        apply_resp = _socket_action_request(
+            action="subagent_auto_apply",
+            payload={
+                "config": draft_config,
+                "allow_warnings": apply_with_warnings,
+                "auto_create_persona": not no_auto_create_persona,
+                "timeout": timeout,
+            },
+            timeout=timeout,
+        )
+        if apply_resp.get("status") == "error":
+            raise RuntimeError(str(apply_resp.get("error") or "socket 请求失败"))
+
+        if apply_resp.get("status") != "ok":
+            message = str(apply_resp.get("message") or "自动应用失败")
+            details = apply_resp.get("data")
+            if details:
+                click.echo(json.dumps(details, ensure_ascii=False, indent=2), err=True)
+            raise RuntimeError(message)
+
+        created_personas = _as_dict(apply_resp.get("data")).get("created_personas", [])
+        if created_personas:
+            click.echo("自动创建的人格：")
+            for persona_id in created_personas:
+                click.echo(f"- {persona_id}")
+
+        click.echo("完成：SubAgent 配置已应用。")
+    except RuntimeError as exc:
+        click.echo(f"错误：{exc}", err=True)
+        raise SystemExit(1)
+
+
+def _as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
 
 
 def _output_response(response: dict, use_json: bool) -> None:

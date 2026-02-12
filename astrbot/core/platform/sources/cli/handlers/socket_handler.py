@@ -7,9 +7,13 @@ import asyncio
 import json
 import os
 import re
+import threading
+import time
 import uuid
 from collections.abc import Callable
 from typing import TYPE_CHECKING
+from urllib import error
+from urllib import request as urlrequest
 
 from astrbot import logger
 from astrbot.core.message.message_event_result import MessageChain
@@ -57,6 +61,13 @@ class SocketClientHandler:
         self.event_committer = event_committer
         self.use_isolated_sessions = use_isolated_sessions
         self.data_path = data_path or os.path.join(os.getcwd(), "data")
+        self._dashboard_token_lock = threading.Lock()
+        self._dashboard_token_cache: dict[str, str | float | None] = {
+            "token": None,
+            "expires_at": 0.0,
+            "base_url": None,
+            "username": None,
+        }
 
     async def handle(self, client_socket) -> None:
         """处理单个客户端连接"""
@@ -98,10 +109,12 @@ class SocketClientHandler:
 
             # 处理请求
             if action == "get_logs":
-                # 获取日志
                 response = await self._get_logs(request, request_id)
+            elif action == "subagent_auto_plan":
+                response = await self._subagent_auto_plan(request, request_id)
+            elif action == "subagent_auto_apply":
+                response = await self._subagent_auto_apply(request, request_id)
             else:
-                # 处理消息
                 message_text = request.get("message", "")
                 response = await self._process_message(message_text, request_id)
 
@@ -301,6 +314,233 @@ class SocketClientHandler:
         except Exception as e:
             logger.exception("Error getting logs")
             return ResponseBuilder.build_error(f"Error getting logs: {e}", request_id)
+
+    async def _subagent_auto_plan(self, request: dict, request_id: str) -> str:
+        timeout = self._normalize_timeout(request.get("timeout", 20.0))
+        payload = {
+            "goal": request.get("goal", ""),
+            "max_agents": request.get("max_agents", 2),
+            "max_tools_per_agent": request.get("max_tools_per_agent", 4),
+        }
+        if request.get("default_provider_id"):
+            payload["default_provider_id"] = request.get("default_provider_id")
+        if request.get("default_persona_id"):
+            payload["default_persona_id"] = request.get("default_persona_id")
+
+        return await self._proxy_subagent_request(
+            endpoint="/api/subagent/auto-plan",
+            payload=payload,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    async def _subagent_auto_apply(self, request: dict, request_id: str) -> str:
+        timeout = self._normalize_timeout(request.get("timeout", 20.0))
+        payload = {
+            "config": request.get("config", {}),
+            "allow_warnings": bool(request.get("allow_warnings", False)),
+            "auto_create_persona": bool(request.get("auto_create_persona", True)),
+        }
+        return await self._proxy_subagent_request(
+            endpoint="/api/subagent/auto-apply",
+            payload=payload,
+            request_id=request_id,
+            timeout=timeout,
+        )
+
+    async def _proxy_subagent_request(
+        self,
+        endpoint: str,
+        payload: dict,
+        request_id: str,
+        timeout: float,
+    ) -> str:
+        try:
+            response = await asyncio.to_thread(
+                self._request_subagent_api,
+                endpoint,
+                payload,
+                timeout,
+            )
+            response["request_id"] = request_id
+            return json.dumps(response, ensure_ascii=False)
+        except Exception as e:
+            logger.exception("Subagent socket proxy failed")
+            return ResponseBuilder.build_error(
+                f"Subagent request failed: {e}",
+                request_id,
+            )
+
+    def _request_subagent_api(
+        self, endpoint: str, payload: dict, timeout: float
+    ) -> dict:
+        dashboard = self._load_dashboard_config()
+        username = str(dashboard.get("username", "")).strip()
+        password = str(dashboard.get("password", "")).strip()
+        host = str(dashboard.get("host", "127.0.0.1") or "127.0.0.1").strip()
+        port = dashboard.get("port", 6185)
+
+        if not username or not password:
+            raise RuntimeError("Dashboard credentials are not configured")
+
+        if host in {"0.0.0.0", "::"}:
+            host = "127.0.0.1"
+
+        base_url = f"http://{host}:{port}"
+        token = self._get_dashboard_token(base_url, username, password, timeout)
+        response = self._http_json_request(
+            "POST",
+            f"{base_url}{endpoint}",
+            payload,
+            token=token,
+            timeout=timeout,
+        )
+        if self._is_dashboard_auth_error(response):
+            self._clear_dashboard_token_cache()
+            retry_token = self._get_dashboard_token(
+                base_url, username, password, timeout
+            )
+            response = self._http_json_request(
+                "POST",
+                f"{base_url}{endpoint}",
+                payload,
+                token=retry_token,
+                timeout=timeout,
+            )
+        return response
+
+    def _load_dashboard_config(self) -> dict:
+        config_path = os.path.join(self.data_path, "cmd_config.json")
+        try:
+            config = None
+            for encoding in ("utf-8", "utf-8-sig"):
+                try:
+                    with open(config_path, encoding=encoding) as f:
+                        config = json.load(f)
+                    break
+                except json.JSONDecodeError:
+                    continue
+
+            if config is None:
+                raise RuntimeError("Invalid config JSON")
+
+            if isinstance(config, dict):
+                dashboard = config.get("dashboard", {})
+                if isinstance(dashboard, dict):
+                    return dashboard
+        except FileNotFoundError:
+            raise RuntimeError(f"Config file not found: {config_path}")
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid config JSON: {e}")
+        except OSError as e:
+            raise RuntimeError(f"Failed to read config: {e}")
+        return {}
+
+    def _normalize_timeout(self, timeout: object) -> float:
+        try:
+            value = float(timeout)
+        except (TypeError, ValueError):
+            return 20.0
+        return max(5.0, min(value, 300.0))
+
+    def _clear_dashboard_token_cache(self) -> None:
+        with self._dashboard_token_lock:
+            self._dashboard_token_cache = {
+                "token": None,
+                "expires_at": 0.0,
+                "base_url": None,
+                "username": None,
+            }
+
+    def _get_dashboard_token(
+        self,
+        base_url: str,
+        username: str,
+        password: str,
+        timeout: float,
+    ) -> str:
+        now = time.time()
+        with self._dashboard_token_lock:
+            token = self._dashboard_token_cache.get("token")
+            expires_at = float(self._dashboard_token_cache.get("expires_at") or 0.0)
+            cached_base = self._dashboard_token_cache.get("base_url")
+            cached_username = self._dashboard_token_cache.get("username")
+            if (
+                isinstance(token, str)
+                and token
+                and now < expires_at
+                and cached_base == base_url
+                and cached_username == username
+            ):
+                return token
+
+            login_resp = self._http_json_request(
+                "POST",
+                f"{base_url}/api/auth/login",
+                {
+                    "username": username,
+                    "password": password,
+                },
+                timeout=timeout,
+            )
+            if login_resp.get("status") != "ok":
+                message = str(login_resp.get("message") or "dashboard login failed")
+                raise RuntimeError(message)
+
+            data = login_resp.get("data")
+            refreshed_token = data.get("token") if isinstance(data, dict) else None
+            if not refreshed_token:
+                raise RuntimeError("Dashboard login did not return token")
+
+            token_ttl = min(600.0, max(30.0, self._normalize_timeout(timeout) * 3.0))
+            self._dashboard_token_cache = {
+                "token": str(refreshed_token),
+                "expires_at": now + token_ttl,
+                "base_url": base_url,
+                "username": username,
+            }
+            return str(refreshed_token)
+
+    def _is_dashboard_auth_error(self, response: dict) -> bool:
+        if not isinstance(response, dict):
+            return False
+        if str(response.get("status", "")).lower() != "error":
+            return False
+        message = str(response.get("message", "")).lower()
+        return "token" in message or "未授权" in message
+
+    def _http_json_request(
+        self,
+        method: str,
+        url: str,
+        payload: dict,
+        token: str | None = None,
+        timeout: float = 20.0,
+    ) -> dict:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        req = urlrequest.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urlrequest.urlopen(req, timeout=timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    return parsed
+                raise RuntimeError("Unexpected dashboard response")
+        except error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+            raise RuntimeError(f"HTTP {e.code}: {body}")
+        except error.URLError as e:
+            raise RuntimeError(f"Cannot connect to dashboard: {e.reason}")
 
 
 class SocketModeHandler(IHandler):

@@ -1,5 +1,7 @@
 import asyncio
+import json
 import os
+import uuid
 
 import pytest
 import pytest_asyncio
@@ -186,6 +188,249 @@ async def test_commands_api(app: Quart, authenticated_header: dict):
     assert data["status"] == "ok"
     # conflicts is a list
     assert isinstance(data["data"], list)
+
+
+@pytest.mark.asyncio
+async def test_subagent_auto_plan_validate_apply(
+    app: Quart,
+    authenticated_header: dict,
+    core_lifecycle_td: AstrBotCoreLifecycle,
+    monkeypatch,
+):
+    test_client = app.test_client()
+
+    tools_resp = await test_client.get(
+        "/api/subagent/available-tools",
+        headers=authenticated_header,
+    )
+    assert tools_resp.status_code == 200
+    tools_data = await tools_resp.get_json()
+    assert tools_data["status"] == "ok"
+    tools = tools_data["data"]
+    assert isinstance(tools, list)
+    if tools:
+        first_tool = tools[0]
+        assert "name" in first_tool
+        assert "description" in first_tool
+
+    selected_tools = [
+        str(item.get("name", "")).strip()
+        for item in tools[:2]
+        if str(item.get("name", "")).strip()
+    ]
+
+    class _FakePlannerProvider:
+        async def text_chat(self, *args, **kwargs):
+            class _Resp:
+                completion_text = json.dumps(
+                    {
+                        "subagents": [
+                            {
+                                "name": "doc_search_agent",
+                                "public_description": "search and summarize",
+                                "system_prompt": "focus on retrieval and summary",
+                                "persona_id": "doc_search_agent_persona",
+                                "tools": selected_tools,
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+            return _Resp()
+
+    monkeypatch.setattr(
+        core_lifecycle_td.provider_manager,
+        "get_using_provider",
+        lambda provider_type, umo=None: _FakePlannerProvider(),
+    )
+
+    plan_resp = await test_client.post(
+        "/api/subagent/auto-plan",
+        headers=authenticated_header,
+        json={"goal": "网页搜索和文档总结", "max_agents": 2},
+    )
+    assert plan_resp.status_code == 200
+    plan_data = await plan_resp.get_json()
+    assert plan_data["status"] == "ok"
+    planner = plan_data["data"].get("planner", {})
+    assert planner.get("engine") == "llm"
+
+    draft_config = plan_data["data"]["draft_config"]
+    assert isinstance(draft_config, dict)
+    assert isinstance(draft_config.get("agents"), list)
+    assert len(draft_config["agents"]) >= 1
+
+    apply_resp = await test_client.post(
+        "/api/subagent/auto-apply",
+        headers=authenticated_header,
+        json={
+            "config": draft_config,
+            "allow_warnings": True,
+        },
+    )
+    assert apply_resp.status_code == 200
+    apply_data = await apply_resp.get_json()
+    assert apply_data["status"] == "ok"
+    assert apply_data["data"]["applied"] is True
+
+    cfg_resp = await test_client.get(
+        "/api/subagent/config", headers=authenticated_header
+    )
+    assert cfg_resp.status_code == 200
+    cfg_data = await cfg_resp.get_json()
+    assert cfg_data["status"] == "ok"
+    assert cfg_data["data"]["main_enable"] is True
+    assert isinstance(cfg_data["data"]["agents"], list)
+    assert len(cfg_data["data"]["agents"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_subagent_auto_apply_auto_creates_missing_persona(
+    app: Quart,
+    authenticated_header: dict,
+    core_lifecycle_td: AstrBotCoreLifecycle,
+    monkeypatch,
+):
+    test_client = app.test_client()
+
+    tools_resp = await test_client.get(
+        "/api/subagent/available-tools",
+        headers=authenticated_header,
+    )
+    assert tools_resp.status_code == 200
+    tools_data = await tools_resp.get_json()
+    assert tools_data["status"] == "ok"
+    tools = tools_data["data"]
+    assert isinstance(tools, list)
+    assert len(tools) > 0
+    tool_name = str(tools[0]["name"])
+
+    new_persona_id = f"auto_persona_{uuid.uuid4().hex[:8]}"
+
+    class _FakePlannerProvider:
+        async def text_chat(self, *args, **kwargs):
+            class _Resp:
+                completion_text = json.dumps(
+                    {
+                        "subagents": [
+                            {
+                                "name": "auto_persona_agent",
+                                "public_description": "test",
+                                "system_prompt": "follow goal",
+                                "persona_id": new_persona_id,
+                                "tools": [tool_name],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                )
+
+            return _Resp()
+
+    fake_provider = _FakePlannerProvider()
+    monkeypatch.setattr(
+        core_lifecycle_td.provider_manager,
+        "get_using_provider",
+        lambda provider_type, umo=None: fake_provider,
+    )
+
+    plan_resp = await test_client.post(
+        "/api/subagent/auto-plan",
+        headers=authenticated_header,
+        json={"goal": "自动创建人格并应用", "max_agents": 1},
+    )
+    assert plan_resp.status_code == 200
+    plan_data = await plan_resp.get_json()
+    assert plan_data["status"] == "ok"
+
+    draft_config = plan_data["data"]["draft_config"]
+    apply_resp = await test_client.post(
+        "/api/subagent/auto-apply",
+        headers=authenticated_header,
+        json={
+            "config": draft_config,
+            "allow_warnings": True,
+            "auto_create_persona": True,
+        },
+    )
+    assert apply_resp.status_code == 200
+    apply_data = await apply_resp.get_json()
+    assert apply_data["status"] == "ok"
+    assert new_persona_id in apply_data["data"]["created_personas"]
+
+    created_persona = await core_lifecycle_td.persona_mgr.get_persona(new_persona_id)
+    assert created_persona.persona_id == new_persona_id
+
+
+@pytest.mark.asyncio
+async def test_subagent_auto_apply_warn_and_error(
+    app: Quart, authenticated_header: dict
+):
+    test_client = app.test_client()
+
+    warning_config = {
+        "main_enable": True,
+        "remove_main_duplicate_tools": True,
+        "agents": [
+            {
+                "name": "warn_agent",
+                "enabled": True,
+                "public_description": "warn",
+                "system_prompt": "",
+                "provider_id": None,
+                "persona_id": None,
+                "tools": ["tool_not_exists"],
+            }
+        ],
+    }
+
+    warn_resp = await test_client.post(
+        "/api/subagent/auto-apply",
+        headers=authenticated_header,
+        json={"config": warning_config, "allow_warnings": False},
+    )
+    assert warn_resp.status_code == 200
+    warn_data = await warn_resp.get_json()
+    assert warn_data["status"] == "error"
+    assert "warnings" in warn_data["data"]
+    assert len(warn_data["data"]["warnings"]) >= 1
+
+    error_config = {
+        "main_enable": True,
+        "remove_main_duplicate_tools": True,
+        "agents": [
+            {
+                "name": "dup_agent",
+                "enabled": True,
+                "public_description": "a",
+                "system_prompt": "",
+                "provider_id": None,
+                "persona_id": None,
+                "tools": [],
+            },
+            {
+                "name": "dup_agent",
+                "enabled": True,
+                "public_description": "b",
+                "system_prompt": "",
+                "provider_id": None,
+                "persona_id": None,
+                "tools": [],
+            },
+        ],
+    }
+
+    error_resp = await test_client.post(
+        "/api/subagent/auto-apply",
+        headers=authenticated_header,
+        json={"config": error_config, "allow_warnings": True},
+    )
+    assert error_resp.status_code == 200
+    error_data = await error_resp.get_json()
+    assert error_data["status"] == "error"
+    assert "errors" in error_data["data"]
+    assert len(error_data["data"]["errors"]) >= 1
 
 
 @pytest.mark.asyncio
